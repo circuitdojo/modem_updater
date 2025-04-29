@@ -73,10 +73,11 @@ use probe_rs::{MemoryInterface, Session};
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, BufRead};
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
+use thiserror::Error;
 use zip::read::ZipArchive;
 
 /// Maximum time in seconds to wait for mass erase operation
@@ -84,7 +85,7 @@ const MASS_ERASE_TIMEOUT: i64 = 30;
 
 /// Address of the fault event register
 const FAULT_EVENT: u64 = 0x4002A100;
-/// Address of the command event register  
+/// Address of the command event register
 const COMMAND_EVENT: u64 = 0x4002A108;
 /// Address of the data event register
 const DATA_EVENT: u64 = 0x4002A110;
@@ -93,6 +94,27 @@ const DATA_EVENT: u64 = 0x4002A110;
 const IPC_PIPELINED_MAX_BUFFER_SIZE: usize = 0xE000;
 /// Maximum buffer size for non-pipelined operations
 const IPC_MAX_BUFFER_SIZE: usize = 0x10000;
+
+#[derive(Error, Debug)]
+pub enum ModemUpdateError {
+    /// Error while writing to flash
+    #[error("{0}")]
+    ProbeError(#[from] probe_rs::Error),
+    /// Timeout while waiting for ACK or NACK response
+    #[error("Timeout waiting for ACK or NACK response")]
+    Timeout,
+    /// NACK response received
+    #[error("NACK response, code {0:08X}")]
+    NACKResponseError(u32),
+    #[error("Modem triggered FAULT_EVENT")]
+    FaultEventError,
+    #[error("Unable to find modem firmware loader")]
+    LoaderNotFound,
+    #[error("No segments found!")]
+    NoSegmentsFound,
+    #[error("No digest found!")]
+    NoDigestFound,
+}
 
 /// Main struct for performing modem firmware updates
 pub struct ModemUpdater<'a> {
@@ -103,7 +125,7 @@ pub struct ModemUpdater<'a> {
 }
 
 /// Converts a byte slice into a 32-bit word using little-endian ordering
-fn bytes_to_word(bts: &[u8]) -> u32 {
+fn _bytes_to_word(bts: &[u8]) -> u32 {
     let mut result: u32 = 0;
     for (i, b) in bts.iter().enumerate() {
         result |= (*b as u32) << (8 * i);
@@ -140,7 +162,7 @@ impl<'a> ModemUpdater<'a> {
     /// * `Ok(true)` if verification succeeded
     /// * `Ok(false)` if verification failed
     /// * `Err` if an error occurred during verification
-    pub fn verify(&mut self, mfw_zip: &str) -> Result<bool, io::Error> {
+    pub fn verify(&mut self, mfw_zip: &str) -> Result<bool, ModemUpdateError> {
         let mut result = false;
 
         // Get temporary directory
@@ -178,7 +200,7 @@ impl<'a> ModemUpdater<'a> {
     /// # Returns
     /// * `Ok(())` if programming and verification succeeded
     /// * `Err` if an error occurred during programming or verification
-    pub fn program_and_verify(&mut self, mfw_zip: &str) -> Result<(), io::Error> {
+    pub fn program_and_verify(&mut self, mfw_zip: &str) -> Result<(), ModemUpdateError> {
         // Get temporary directory
         let temp_dir = TempDir::new().unwrap();
 
@@ -214,7 +236,7 @@ impl<'a> ModemUpdater<'a> {
     }
 
     /// Reads the key digest from the device
-    fn read_key_digest(&mut self) -> Result<String, io::Error> {
+    fn read_key_digest(&mut self) -> Result<String, ModemUpdateError> {
         self.wait_and_ack_events()?;
 
         let mut core = self.session.core(0).unwrap();
@@ -226,7 +248,7 @@ impl<'a> ModemUpdater<'a> {
     ///
     /// # Arguments
     /// * `segment` - Path to the segment file to program
-    fn program_segment(&mut self, segment: &PathBuf) -> Result<(), io::Error> {
+    fn program_segment(&mut self, segment: &PathBuf) -> Result<(), ModemUpdateError> {
         let bufsz = if self.pipelined {
             IPC_PIPELINED_MAX_BUFFER_SIZE
         } else {
@@ -238,9 +260,8 @@ impl<'a> ModemUpdater<'a> {
         // Reader for the hex file
         let hex = BinFile::from_file(segment).unwrap();
 
-        // Cet chunks
+        // Get chunks
         let chunks = hex.segments().chunks(Some(bufsz), None).unwrap();
-        let chunks_len = chunks.len();
 
         // Create chunks
         for (i, (addr, data)) in chunks.into_iter().enumerate() {
@@ -248,23 +269,19 @@ impl<'a> ModemUpdater<'a> {
 
             if self.pipelined {
                 if i == 0 {
-                    self.write_chunk(&data, (i % 2) as u32);
+                    self.write_chunk(&data, (i % 2) as u32)?;
                     self.commit_chunk(addr as u32, data.len(), (i % 2) as u32);
+                    self.wait_and_ack_events()?;
                     log::info!("Wrote chunk: {}:{} for bank {}", i, addr, i % 2);
                     continue;
                 }
 
-                self.write_chunk(&data, (i % 2) as u32);
-                self.wait_and_ack_events()?;
+                self.write_chunk(&data, (i % 2) as u32)?;
                 self.commit_chunk(addr as u32, data.len(), (i % 2) as u32);
+                self.wait_and_ack_events()?;
                 log::info!("Wrote chunk: {}:{} for bank {}", i, addr, i % 2);
-
-                // If it's the last wait for ack
-                if i == chunks_len - 1 {
-                    self.wait_and_ack_events()?;
-                }
             } else {
-                self.write_chunk(&data, 0);
+                self.write_chunk(&data, 0)?;
                 self.commit_chunk(addr as u32, data.len(), 0);
                 self.wait_and_ack_events()?;
             }
@@ -278,7 +295,7 @@ impl<'a> ModemUpdater<'a> {
     /// # Arguments
     /// * `data` - Data chunk to write
     /// * `bank` - Bank number for pipelined operations
-    fn write_chunk(&mut self, data: &[u8], bank: u32) {
+    fn write_chunk(&mut self, data: &[u8], bank: u32) -> Result<(), ModemUpdateError> {
         let ram_address = if self.pipelined {
             0x2000001C + IPC_PIPELINED_MAX_BUFFER_SIZE * bank as usize
         } else {
@@ -286,18 +303,17 @@ impl<'a> ModemUpdater<'a> {
         };
 
         // Get the core
-        let mut core = self.session.core(0).unwrap();
-
-        // Write all the words
-        let data_words = data.chunks(4).map(bytes_to_word).collect::<Vec<u32>>();
+        let mut core = self.session.core(0)?;
 
         log::info!(
-            "Writing {} words to address {:08X}",
-            data_words.len(),
+            "Writing {} bytes to address {:08X}",
+            data.len(),
             ram_address
         );
 
-        core.write_32(ram_address as u64, &data_words).unwrap();
+        core.write(ram_address as u64, data)?;
+
+        Ok(())
     }
 
     /// Commits a written chunk to flash memory
@@ -328,7 +344,7 @@ impl<'a> ModemUpdater<'a> {
     }
 
     /// Internal verification function
-    fn _verify(&mut self) -> Result<bool, io::Error> {
+    fn _verify(&mut self) -> Result<bool, ModemUpdateError> {
         let mut ranges_to_verify = Vec::new();
         for s in self.segments.values() {
             // Reader for the hex file
@@ -408,7 +424,7 @@ impl<'a> ModemUpdater<'a> {
     /// # Returns
     /// * `Ok(())` if events were received and acknowledged
     /// * `Err` if a timeout or error occurred
-    fn wait_and_ack_events(&mut self) -> Result<(), io::Error> {
+    fn wait_and_ack_events(&mut self) -> Result<(), ModemUpdateError> {
         // Loop until we get an ACK or NACK with timeout
         let start = Utc::now().timestamp_millis();
 
@@ -421,28 +437,28 @@ impl<'a> ModemUpdater<'a> {
         loop {
             // Check if we've timed out
             if Utc::now().timestamp_millis() - start > MASS_ERASE_TIMEOUT * 1000 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Timeout waiting for ACK or NACK response",
-                ));
+                return Err(ModemUpdateError::Timeout);
             }
 
             // If fault is not 0, we have a fault
             if let Ok(response) = core.read_word_32(FAULT_EVENT) {
                 if response != 0 {
                     fault = true;
+                    log::debug!("Has fault event");
                     break;
                 }
             }
 
             if let Ok(response) = core.read_word_32(COMMAND_EVENT) {
                 if response != 0 {
+                    log::debug!("Has command event");
                     break;
                 }
             }
 
             if let Ok(response) = core.read_word_32(DATA_EVENT) {
                 if response != 0 {
+                    log::debug!("Has data event");
                     break;
                 }
             }
@@ -454,20 +470,17 @@ impl<'a> ModemUpdater<'a> {
         core.write_word_32(DATA_EVENT, 0).unwrap();
 
         let response = core.read_word_32(0x2000000C).unwrap();
+        log::debug!("Response: {:08X}", response);
+
         if (response & 0xFF000000) == 0xA5000000 {
             log::info!("ACK response, code {:08X}", response);
         } else if (response & 0xFF000000) == 0x5A000000 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("NACK response, code {:08X}", response),
-            ));
+            log::warn!("NACK response, code {:08X}", response);
+            return Err(ModemUpdateError::NACKResponseError(response));
         }
 
         if fault {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "modem triggered FAULT_EVENT",
-            ));
+            return Err(ModemUpdateError::FaultEventError);
         }
 
         Ok(())
@@ -531,7 +544,11 @@ impl<'a> ModemUpdater<'a> {
     /// # Arguments
     /// * `mfw_zip` - Path to the firmware zip file
     /// * `temp_dir` - Temporary directory for extracted files
-    fn process_zip_file(&mut self, mfw_zip: &str, temp_dir: &TempDir) -> Result<(), io::Error> {
+    fn process_zip_file(
+        &mut self,
+        mfw_zip: &str,
+        temp_dir: &TempDir,
+    ) -> Result<(), ModemUpdateError> {
         // Unzip to temp dir
         let file = File::open(mfw_zip).unwrap();
         ZipArchive::new(file)
@@ -545,6 +562,9 @@ impl<'a> ModemUpdater<'a> {
         // Get digest
         let digest_id = self.read_key_digest()?;
 
+        // Regex
+        let m = Regex::new(r"\.ipc_dfu\.signed_(\d+)\.(\d+)\.(\d+)\.ihex").unwrap();
+
         // Iterate each file
         for entry in std::fs::read_dir(temp_dir).unwrap() {
             let file = entry.unwrap();
@@ -557,7 +577,6 @@ impl<'a> ModemUpdater<'a> {
 
                 // Use regex to get the version
                 // m = re.match(r"\.ipc_dfu\.signed_(\d+)\.(\d+)\.(\d+)\.ihex", f[7:])
-                let m = Regex::new(r"\.ipc_dfu\.signed_(\d+)\.(\d+)\.(\d+)\.ihex").unwrap();
 
                 // Create a tuple from the match
                 let (major, minor, patch) = match m.captures(&file_name) {
@@ -594,12 +613,11 @@ impl<'a> ModemUpdater<'a> {
         let modem_firmware_loader = match modem_firmware_loader {
             Some(v) => v,
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Unable to find modem firmware loader",
-                ))
+                return Err(ModemUpdateError::LoaderNotFound);
             }
         };
+
+        let m = Regex::new(r"firmware\.update\.image\.segments\.(\d+).hex").unwrap();
 
         for entry in std::fs::read_dir(temp_dir).unwrap() {
             let file = entry.unwrap();
@@ -608,7 +626,6 @@ impl<'a> ModemUpdater<'a> {
             // Do regex for this
             // m = re.match(r"firmware\.update\.image\.segments\.(\d+).hex", f)
 
-            let m = Regex::new(r"firmware\.update\.image\.segments\.(\d+).hex").unwrap();
             if let Some(c) = m.captures(&file_name) {
                 let segment = c.get(1).unwrap().as_str();
 
@@ -622,7 +639,7 @@ impl<'a> ModemUpdater<'a> {
 
         // Check if segments are empty
         if self.segments.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::Other, "No segments found!"));
+            return Err(ModemUpdateError::NoSegmentsFound);
         }
 
         log::debug!(
@@ -641,11 +658,11 @@ impl<'a> ModemUpdater<'a> {
             let mut reader = std::io::BufReader::new(f);
             let mut line = String::new();
 
+            let m =
+                Regex::new(r"SHA256 of all ranges in ascending address order:\s*(\w{64})").unwrap();
+
             while let Ok(_sz) = reader.read_line(&mut line) {
                 if line.contains("SHA256 of all ranges in ascending address order:") {
-                    let m =
-                        Regex::new(r"SHA256 of all ranges in ascending address order:\s*(\w{64})")
-                            .unwrap();
                     if let Some(c) = m.captures(&line) {
                         log::info!("Firmware digest: {}", c.get(1).unwrap().as_str());
                         self.firmware_update_digest = Some(c.get(1).unwrap().as_str().to_string());
@@ -655,10 +672,7 @@ impl<'a> ModemUpdater<'a> {
             }
 
             if self.firmware_update_digest.is_none() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "No firmware digest found!",
-                ));
+                return Err(ModemUpdateError::NoDigestFound);
             }
         }
 
