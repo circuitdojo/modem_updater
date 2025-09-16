@@ -168,7 +168,7 @@ impl<'a> ModemUpdater<'a> {
         // Get temporary directory
         let temp_dir = TempDir::new().unwrap();
 
-        self.setup_device();
+        self.setup_device()?;
         self.process_zip_file(mfw_zip, &temp_dir)?;
 
         log::info!("Verifying modem firmware.");
@@ -187,7 +187,7 @@ impl<'a> ModemUpdater<'a> {
         };
 
         // Reset
-        self.session.core(0).unwrap().reset().unwrap();
+        self.session.core(0)?.reset()?;
 
         Ok(result)
     }
@@ -204,7 +204,7 @@ impl<'a> ModemUpdater<'a> {
         // Get temporary directory
         let temp_dir = TempDir::new().unwrap();
 
-        self.setup_device();
+        self.setup_device()?;
         self.process_zip_file(mfw_zip, &temp_dir)?;
 
         log::info!("Programming modem firmware..");
@@ -239,8 +239,8 @@ impl<'a> ModemUpdater<'a> {
     fn read_key_digest(&mut self) -> Result<String, ModemUpdateError> {
         self.wait_and_ack_events()?;
 
-        let mut core = self.session.core(0).unwrap();
-        let digest_data = change_endianness(core.read_word_32(0x20000010).unwrap(), 4);
+        let mut core = self.session.core(0)?;
+        let digest_data = change_endianness(core.read_word_32(0x20000010)?, 4);
         Ok(format!("{:08X}", digest_data)[..7].to_string())
     }
 
@@ -270,19 +270,19 @@ impl<'a> ModemUpdater<'a> {
             if self.pipelined {
                 if i == 0 {
                     self.write_chunk(&data, (i % 2) as u32)?;
-                    self.commit_chunk(addr as u32, data.len(), (i % 2) as u32);
+                    self.commit_chunk(addr as u32, data.len(), (i % 2) as u32)?;
                     self.wait_and_ack_events()?;
                     log::info!("Wrote chunk: {}:{} for bank {}", i, addr, i % 2);
                     continue;
                 }
 
                 self.write_chunk(&data, (i % 2) as u32)?;
-                self.commit_chunk(addr as u32, data.len(), (i % 2) as u32);
+                self.commit_chunk(addr as u32, data.len(), (i % 2) as u32)?;
                 self.wait_and_ack_events()?;
                 log::info!("Wrote chunk: {}:{} for bank {}", i, addr, i % 2);
             } else {
                 self.write_chunk(&data, 0)?;
-                self.commit_chunk(addr as u32, data.len(), 0);
+                self.commit_chunk(addr as u32, data.len(), 0)?;
                 self.wait_and_ack_events()?;
             }
         }
@@ -322,25 +322,32 @@ impl<'a> ModemUpdater<'a> {
     /// * `addr` - Target flash address
     /// * `data_len` - Length of data to commit
     /// * `bank` - Bank number for pipelined operations
-    fn commit_chunk(&mut self, addr: u32, data_len: usize, bank: u32) {
+    fn commit_chunk(
+        &mut self,
+        addr: u32,
+        data_len: usize,
+        bank: u32,
+    ) -> Result<(), ModemUpdateError> {
         // Get the core
-        let mut core = self.session.core(0).unwrap();
+        let mut core = self.session.core(0)?;
 
         let buffer_offset = bank * IPC_PIPELINED_MAX_BUFFER_SIZE as u32;
-        core.write_word_32(0x20000010, addr).unwrap();
-        core.write_word_32(0x20000014, data_len as u32).unwrap();
+        core.write_word_32(0x20000010, addr)?;
+        core.write_word_32(0x20000014, data_len as u32)?;
         if self.pipelined {
-            core.write_word_32(0x20000018, buffer_offset).unwrap();
+            core.write_word_32(0x20000018, buffer_offset)?;
         }
         if self.pipelined {
             // command = PIPELINE_WRITE
-            core.write_word_32(0x2000000C, 0x9).unwrap();
+            core.write_word_32(0x2000000C, 0x9)?;
         } else {
             // command = WRITE
-            core.write_word_32(0x2000000C, 0x3).unwrap();
+            core.write_word_32(0x2000000C, 0x3)?;
         }
         // start IPC task
-        core.write_word_32(0x4002A004, 1).unwrap();
+        core.write_word_32(0x4002A004, 1)?;
+
+        Ok(())
     }
 
     /// Internal verification function
@@ -362,31 +369,28 @@ impl<'a> ModemUpdater<'a> {
 
         {
             // Get the core
-            let mut core = self.session.core(0).unwrap();
+            let mut core = self.session.core(0)?;
 
             // Write given start, size pairs and number of entries
-            core.write_word_32(0x20000010, ranges_to_verify.len() as u32)
-                .unwrap();
+            core.write_word_32(0x20000010, ranges_to_verify.len() as u32)?;
             for (i, range) in ranges_to_verify.iter().enumerate() {
-                core.write_word_32(0x20000014 + (8 * i) as u64, range.0 as u32)
-                    .unwrap();
-                core.write_word_32(0x20000018 + (8 * i) as u64, (range.1 - range.0) as u32)
-                    .unwrap();
+                core.write_word_32(0x20000014 + (8 * i) as u64, range.0 as u32)?;
+                core.write_word_32(0x20000018 + (8 * i) as u64, (range.1 - range.0) as u32)?;
             }
 
             // command = VERIFY
-            core.write_word_32(0x2000000C, 0x7).unwrap();
+            core.write_word_32(0x2000000C, 0x7)?;
             // start IPC task
-            core.write_word_32(0x4002A004, 1).unwrap();
+            core.write_word_32(0x4002A004, 1)?;
         }
 
         self.wait_and_ack_events()?;
 
         {
             // Get the core
-            let mut core = self.session.core(0).unwrap();
+            let mut core = self.session.core(0)?;
 
-            let response = core.read_word_32(0x2000000C).unwrap();
+            let response = core.read_word_32(0x2000000C)?;
             if (response & 0xFF000000) == 0x5A000000 {
                 panic!("Error while verifying: {:08X}", response & 0xFFFFFF);
             }
@@ -394,8 +398,8 @@ impl<'a> ModemUpdater<'a> {
             // Generate array of addresses from 0x20000010 to 0x2000002D with step of 4
             let sequence = (0x20000010..0x2000002D).step_by(4_usize);
             let digest_data: Vec<u32> = sequence
-                .map(|entry| core.read_word_32(entry).unwrap())
-                .collect();
+                .map(|entry| core.read_word_32(entry))
+                .collect::<Result<Vec<_>, _>>()?;
 
             // Generate string from digest data
             let digest_str = digest_data.iter().fold(String::new(), |mut acc, x| {
@@ -429,7 +433,7 @@ impl<'a> ModemUpdater<'a> {
         let start = Utc::now().timestamp_millis();
 
         // Get the core
-        let mut core = self.session.core(0).unwrap();
+        let mut core = self.session.core(0)?;
 
         // Fault
         let mut fault = false;
@@ -465,11 +469,11 @@ impl<'a> ModemUpdater<'a> {
         }
 
         // Reset events
-        core.write_word_32(FAULT_EVENT, 0).unwrap();
-        core.write_word_32(COMMAND_EVENT, 0).unwrap();
-        core.write_word_32(DATA_EVENT, 0).unwrap();
+        core.write_word_32(FAULT_EVENT, 0)?;
+        core.write_word_32(COMMAND_EVENT, 0)?;
+        core.write_word_32(DATA_EVENT, 0)?;
 
-        let response = core.read_word_32(0x2000000C).unwrap();
+        let response = core.read_word_32(0x2000000C)?;
         log::debug!("Response: {:08X}", response);
 
         if (response & 0xFF000000) == 0xA5000000 {
@@ -489,54 +493,54 @@ impl<'a> ModemUpdater<'a> {
     /// Sets up the device for firmware operations
     ///
     /// Configures UICR settings, IPC, and RAM for firmware updates
-    fn setup_device(&mut self) {
-        let mut target = self.session.core(0).unwrap();
+    fn setup_device(&mut self) -> Result<(), ModemUpdateError> {
+        // First, reset and halt the core to ensure we have control
+        // This is especially important if application firmware is already running
+        let mut target = self.session.core(0)?;
+        target.reset_and_halt(Duration::from_secs(5))?;
 
         // Init UICR.HFXOSR if necessary
-        if target.read_word_32(0x00FF801C).unwrap() == 0xFFFFFFFF {
+        if target.read_word_32(0x00FF801C)? == 0xFFFFFFFF {
             log::info!("UICR.HFXOSR is not set, setting it to 0x0E");
-            target.write_32(0x00FF801C, &[0x0000000E]).unwrap();
+            target.write_32(0x00FF801C, &[0x0000000E])?;
         }
 
         // Init UICR.HFXOCNT if necessary
-        if target.read_word_32(0x00FF8020).unwrap() == 0xFFFFFFFF {
+        if target.read_word_32(0x00FF8020)? == 0xFFFFFFFF {
             log::info!("UICR.HFXOCNT is not set, setting it to 0x20");
-            target.write_word_32(0x00FF8020, 0x00000020).unwrap();
+            target.write_word_32(0x00FF8020, 0x00000020)?;
         }
 
-        // Reset and halt
-        target.reset_and_halt(Duration::from_secs(30)).unwrap();
-
         // Configure IPC
-        target.write_word_32(0x500038A8, 0x00000002).unwrap();
+        target.write_word_32(0x500038A8, 0x00000002)?;
 
         // Configure IPC HW for DFU
-        target.write_word_32(0x4002A514, 0x00000002).unwrap();
-        target.write_word_32(0x4002A51C, 0x00000008).unwrap();
-        target.write_word_32(0x4002A610, 0x21000000).unwrap();
-        target.write_word_32(0x4002A614, 0x00000000).unwrap();
-        target.write_word_32(0x4002A590, 0x00000001).unwrap();
-        target.write_word_32(0x4002A598, 0x00000004).unwrap();
-        target.write_word_32(0x4002A5A0, 0x00000010).unwrap();
+        target.write_word_32(0x4002A514, 0x00000002)?;
+        target.write_word_32(0x4002A51C, 0x00000008)?;
+        target.write_word_32(0x4002A610, 0x21000000)?;
+        target.write_word_32(0x4002A614, 0x00000000)?;
+        target.write_word_32(0x4002A590, 0x00000001)?;
+        target.write_word_32(0x4002A598, 0x00000004)?;
+        target.write_word_32(0x4002A5A0, 0x00000010)?;
 
         // Configure RAM as non-secure
         for n in 0..32 {
-            target
-                .write_word_32(0x50003700 + (n * 4), 0x00000007)
-                .unwrap();
+            target.write_word_32(0x50003700 + (n * 4), 0x00000007)?;
         }
 
         // Allocate memory in RAM
-        target.write_word_32(0x20000000, 0x80010000).unwrap();
-        target.write_word_32(0x20000004, 0x2100000C).unwrap();
-        target.write_word_32(0x20000008, 0x0003FC00).unwrap();
+        target.write_word_32(0x20000000, 0x80010000)?;
+        target.write_word_32(0x20000004, 0x2100000C)?;
+        target.write_word_32(0x20000008, 0x0003FC00)?;
 
         // Reset the modem
-        target.write_word_32(0x50005610, 0).unwrap();
-        target.write_word_32(0x50005614, 1).unwrap();
-        target.write_word_32(0x50005610, 1).unwrap();
-        target.write_word_32(0x50005614, 0).unwrap();
-        target.write_word_32(0x50005610, 0).unwrap();
+        target.write_word_32(0x50005610, 0)?;
+        target.write_word_32(0x50005614, 1)?;
+        target.write_word_32(0x50005610, 1)?;
+        target.write_word_32(0x50005614, 0)?;
+        target.write_word_32(0x50005610, 0)?;
+
+        Ok(())
     }
 
     /// Processes the firmware zip file and extracts necessary components
@@ -687,8 +691,8 @@ impl<'a> ModemUpdater<'a> {
 
         {
             // Start IPC task
-            let mut core = self.session.core(0).unwrap();
-            core.write_word_32(0x4002A004, 0x00000001).unwrap();
+            let mut core = self.session.core(0)?;
+            core.write_word_32(0x4002A004, 0x00000001)?;
         }
 
         // Wait for event
