@@ -1,6 +1,6 @@
 [package]
 name = "modem_updater"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Jared Wolff <jared@circuitdojo.com>"]
 description = "Utility for updating nRF91 modem firmware"
 edition = "2021"
@@ -13,6 +13,6 @@ env_logger = "0.11"
 log = "0.4"
 probe-rs = "0.29"
 regex = "1.11"
-tempfile = "3.22"
+tempfile = "3.23"
 zip = "2.4"
 thiserror = "2.0"

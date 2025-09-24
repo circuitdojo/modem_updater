@@ -10,6 +10,50 @@ Validated working on:
 - nRF9151
 - nRF9161
 
+## Getting Started
+
+### 1. Install the Rust toolchain
+
+Install Rust using [`rustup`](https://rustup.rs/).
+
+On macOS and Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+On Windows download and run the installer from [rustup.rs](https://rustup.rs/), then open a new PowerShell or Command Prompt window.
+
+After installation, confirm the toolchain is available:
+
+```bash
+rustc --version
+cargo --version
+```
+
+### 2. Clone this repository
+
+```bash
+git clone https://github.com/circuitdojo/modem_updater.git
+cd modem_updater
+```
+
+### 3. Build the project
+
+Build a release binary locally:
+
+```bash
+cargo build --release
+```
+
+The resulting executable is located in `target/release/`.
+
+### 4. Install probe dependencies
+
+- **Linux:** ensure `libusb-1.0` is present (`sudo apt install libusb-1.0-0`).
+- **macOS:** install [Homebrew](https://brew.sh/) and run `brew install libusb` if it is not already available.
+- **Windows:** if necessary, use [Zadig](https://zadig.akeo.ie/) to install a WinUSB driver for your debug probe.
+
 ## CLI Usage
 
 To verify the modem firmware, run:
@@ -23,6 +67,14 @@ To program and verify the modem firmware, run:
 ```bash
 cargo run --bin updater -- program <path_to_firmware_zip>
 ```
+
+### Install the CLI globally
+
+```bash
+cargo install --path .
+```
+
+This places the `modem_updater` binary in `~/.cargo/bin` (or the equivalent on Windows).
 
 ## Acknowledgements
 
