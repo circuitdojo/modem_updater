@@ -1,0 +1,64 @@
+name: Build Binaries
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary_path: target/release/updater
+          - os: macos-latest
+            binary_path: target/release/updater
+          - os: windows-latest
+            binary_path: target/release/updater.exe
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev libusb-1.0-0-dev pkg-config
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --bin updater
+
+      - name: Collect artifact
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp "${{ matrix.binary_path }}" artifacts/
+          ls artifacts
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: modem-updater-${{ matrix.os }}
+          path: artifacts/*
+          if-no-files-found: error
