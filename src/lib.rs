@@ -566,8 +566,9 @@ impl<'a> ModemUpdater<'a> {
         // Get digest
         let digest_id = self.read_key_digest()?;
 
-        // Regex
-        let m = Regex::new(r"\.ipc_dfu\.signed_(\d+)\.(\d+)\.(\d+)\.ihex").unwrap();
+        // Regex - matches both formats: .ipc_dfu.signed_X.Y.Z.ihex and ipc-dfu_nrf91x1_X.Y.Z.ihex
+        let m = Regex::new(r"(?:\.ipc_dfu\.signed_|ipc-dfu_nrf91x1_)(\d+)\.(\d+)\.(\d+)\.ihex")
+            .unwrap();
 
         // Iterate each file
         for entry in std::fs::read_dir(temp_dir).unwrap() {
@@ -575,8 +576,10 @@ impl<'a> ModemUpdater<'a> {
             let file_name = file.file_name().into_string().unwrap();
             log::debug!("Processing file: {}", file_name);
 
-            // Process files
-            if file_name.starts_with(format!("{}.ipc_dfu.signed_", digest_id).as_str()) {
+            // Process files - match both old format (digest.ipc_dfu.signed_) and new format (ipc-dfu_nrf91x1_)
+            if file_name.starts_with(format!("{}.ipc_dfu.signed_", digest_id).as_str())
+                || file_name.starts_with("ipc-dfu_nrf91x1_")
+            {
                 modem_firmware_loader = Some(temp_dir.path().join(&file_name));
 
                 // Use regex to get the version
