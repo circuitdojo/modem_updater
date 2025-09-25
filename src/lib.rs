@@ -122,6 +122,9 @@ pub struct ModemUpdater<'a> {
     pipelined: bool,
     segments: BTreeMap<String, PathBuf>,
     firmware_update_digest: Option<String>,
+    progress_callback: Option<Box<dyn FnMut(u64, u64) + 'static>>,
+    progress_total: u64,
+    progress_current: u64,
 }
 
 /// Converts a byte slice into a 32-bit word using little-endian ordering
@@ -150,7 +153,48 @@ impl<'a> ModemUpdater<'a> {
             pipelined: false,
             segments: BTreeMap::new(),
             firmware_update_digest: None,
+            progress_callback: None,
+            progress_total: 0,
+            progress_current: 0,
         }
+    }
+
+    /// Registers a callback that receives `(bytes_written, total_bytes)` updates
+    pub fn set_progress_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(u64, u64) + 'static,
+    {
+        self.progress_callback = Some(Box::new(callback));
+    }
+
+    fn emit_progress(&mut self) {
+        if let Some(cb) = self.progress_callback.as_mut() {
+            cb(self.progress_current, self.progress_total);
+        }
+    }
+
+    fn increment_progress(&mut self, bytes: usize) {
+        if self.progress_total == 0 {
+            return;
+        }
+
+        self.progress_current = (self.progress_current + bytes as u64).min(self.progress_total);
+        self.emit_progress();
+    }
+
+    fn calculate_total_segment_bytes(&self) -> u64 {
+        let mut total = 0u64;
+
+        for path in self.segments.values() {
+            let hex = BinFile::from_file(path).unwrap();
+
+            for segment in hex.segments() {
+                let (_, data) = segment.get_tuple();
+                total += data.len() as u64;
+            }
+        }
+
+        total
     }
 
     /// Verifies the modem firmware from a zip file without programming
@@ -198,14 +242,22 @@ impl<'a> ModemUpdater<'a> {
     /// * `mfw_zip` - Path to the modem firmware zip file
     ///
     /// # Returns
-    /// * `Ok(())` if programming and verification succeeded
+    /// * `Ok(true)` if programming and verification succeeded
+    /// * `Ok(false)` if programming succeeded but verification failed
     /// * `Err` if an error occurred during programming or verification
-    pub fn program_and_verify(&mut self, mfw_zip: &str) -> Result<(), ModemUpdateError> {
+    pub fn program_and_verify(&mut self, mfw_zip: &str) -> Result<bool, ModemUpdateError> {
         // Get temporary directory
         let temp_dir = TempDir::new().unwrap();
 
         self.setup_device()?;
         self.process_zip_file(mfw_zip, &temp_dir)?;
+
+        let total_bytes = self.calculate_total_segment_bytes();
+        if total_bytes > 0 {
+            self.progress_total = total_bytes;
+            self.progress_current = 0;
+            self.emit_progress();
+        }
 
         log::info!("Programming modem firmware..");
 
@@ -215,24 +267,32 @@ impl<'a> ModemUpdater<'a> {
 
         log::info!("Modem firmware programmed.");
 
+        if self.progress_total > 0 {
+            self.progress_current = self.progress_total;
+            self.emit_progress();
+        }
+
         log::info!("Verifying modem firmware.");
-        match self._verify() {
+        let verified = match self._verify() {
             Ok(v) => {
                 if !v {
                     log::info!("Modem firmware verification failed!");
                 } else {
                     log::info!("Modem firmware verified.");
                 }
+
+                v
             }
             Err(e) => {
                 log::error!("Modem firmware verification failed! Error: {}", e);
+                return Err(e);
             }
         };
 
         // Reset
         self.session.core(0).unwrap().reset().unwrap();
 
-        Ok(())
+        Ok(verified)
     }
 
     /// Reads the key digest from the device
@@ -272,6 +332,7 @@ impl<'a> ModemUpdater<'a> {
                     self.write_chunk(&data, (i % 2) as u32)?;
                     self.commit_chunk(addr as u32, data.len(), (i % 2) as u32)?;
                     self.wait_and_ack_events()?;
+                    self.increment_progress(data.len());
                     log::info!("Wrote chunk: {}:{} for bank {}", i, addr, i % 2);
                     continue;
                 }
@@ -279,11 +340,13 @@ impl<'a> ModemUpdater<'a> {
                 self.write_chunk(&data, (i % 2) as u32)?;
                 self.commit_chunk(addr as u32, data.len(), (i % 2) as u32)?;
                 self.wait_and_ack_events()?;
+                self.increment_progress(data.len());
                 log::info!("Wrote chunk: {}:{} for bank {}", i, addr, i % 2);
             } else {
                 self.write_chunk(&data, 0)?;
                 self.commit_chunk(addr as u32, data.len(), 0)?;
                 self.wait_and_ack_events()?;
+                self.increment_progress(data.len());
             }
         }
 

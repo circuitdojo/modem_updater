@@ -44,6 +44,7 @@
 use std::{thread, time::Duration};
 
 use chrono::Utc;
+use indicatif::{HumanBytes, ProgressBar, ProgressState, ProgressStyle};
 use modem_updater::ModemUpdater;
 use probe_rs::{
     probe::{list::Lister, DebugProbeSelector},
@@ -116,9 +117,73 @@ fn main() {
     let mut updater = ModemUpdater::new(&mut session);
 
     if operation == "verify" {
-        updater.verify(&path).unwrap();
+        match updater.verify(&path) {
+            Ok(true) => println!("Firmware verification succeeded."),
+            Ok(false) => {
+                eprintln!("Firmware verification failed. Inspect device logs for details.");
+                std::process::exit(2);
+            }
+            Err(err) => {
+                eprintln!("Verification error: {err}");
+                std::process::exit(2);
+            }
+        }
     } else if operation == "program" {
-        updater.program_and_verify(&path).unwrap();
+        let progress_bar = ProgressBar::new(0);
+        progress_bar.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+            )
+            .unwrap()
+            .with_key("bytes", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                let _ = write!(w, "{}", HumanBytes(state.pos()));
+            })
+            .with_key("total_bytes", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                if let Some(len) = state.len() {
+                    let _ = write!(w, "{}", HumanBytes(len));
+                } else {
+                    let _ = w.write_str("0 B");
+                }
+            })
+            .progress_chars("=>-"),
+        );
+        progress_bar.enable_steady_tick(Duration::from_millis(100));
+
+        updater.set_progress_callback({
+            let progress = progress_bar.clone();
+            let mut initialized = false;
+            move |current, total| {
+                if !initialized {
+                    progress.set_length(total);
+                    initialized = true;
+                }
+
+                progress.set_position(current.min(total));
+
+                if current >= total {
+                    progress.finish_and_clear();
+                }
+            }
+        });
+
+        match updater.program_and_verify(&path) {
+            Ok(true) => {
+                progress_bar.finish_and_clear();
+                println!("Programming complete. Firmware verification succeeded.");
+            }
+            Ok(false) => {
+                progress_bar.finish_and_clear();
+                eprintln!(
+                    "Programming finished but firmware verification failed. Re-run verify for details."
+                );
+                std::process::exit(3);
+            }
+            Err(err) => {
+                progress_bar.finish_and_clear();
+                eprintln!("Programming error: {err}");
+                std::process::exit(3);
+            }
+        }
     } else {
         println!("\nError: Unknown operation '{}'", operation);
         print_usage();

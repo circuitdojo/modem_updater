@@ -534,9 +534,17 @@ dependencies = [
 
 [[package]]
 name = "modem_updater"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
+ "bin_file",
+ "chrono",
+ "env_logger",
+ "indicatif",
+ "log",
  "probe-rs",
+ "regex",
+ "tempfile",
+ "thiserror",
  "zip",
 ]
 
