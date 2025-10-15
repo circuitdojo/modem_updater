@@ -1,7 +1,10 @@
-name: Build Binaries
+name: Build and Release Binaries
 
 on:
   push:
+    tags:
+      - "v*"
+      - "*.*.*"
     branches:
       - master
   pull_request:
@@ -14,10 +17,13 @@ jobs:
         include:
           - os: ubuntu-latest
             binary_path: target/release/updater
+            artifact_name: updater-linux
           - os: macos-latest
             binary_path: target/release/updater
+            artifact_name: updater-macos
           - os: windows-latest
             binary_path: target/release/updater.exe
+            artifact_name: updater-windows.exe
 
     env:
       CARGO_TERM_COLOR: always
@@ -53,8 +59,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifacts
-          cp "${{ matrix.binary_path }}" artifacts/
-          ls artifacts
+          cp "${{ matrix.binary_path }}" artifacts/${{ matrix.artifact_name }}
+          ls -la artifacts
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -62,3 +68,54 @@ jobs:
           name: modem-updater-${{ matrix.os }}
           path: artifacts/*
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all workflow run artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Linux Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/modem-updater-ubuntu-latest/updater-linux
+          asset_name: modem-updater-${{ github.ref_name }}-linux
+          asset_content_type: application/octet-stream
+
+      - name: Upload macOS Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/modem-updater-macos-latest/updater-macos
+          asset_name: modem-updater-${{ github.ref_name }}-macos
+          asset_content_type: application/octet-stream
+
+      - name: Upload Windows Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/modem-updater-windows-latest/updater-windows.exe
+          asset_name: modem-updater-${{ github.ref_name }}-windows.exe
+          asset_content_type: application/octet-stream
