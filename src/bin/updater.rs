@@ -87,6 +87,7 @@ fn main() {
         probe = match lister.open(DebugProbeSelector {
             vendor_id: 0x2e8a,
             product_id: 0x000c,
+            interface: None,
             serial_number: None,
         }) {
             Ok(p) => p,
