@@ -43,7 +43,7 @@ This places the `updater` binary in `~/.cargo/bin` (or the equivalent on Windows
 
 Sometimes you may need to install dependencies. If your compilation fails here are some suggestions:
 
-- **Linux:** ensure `libusb-1.0` is present (`sudo apt install libusb-1.0-0`).
+- **Linux:** ensure `libusb-1.0` and `libudev-dev` are present (`sudo apt install libusb-1.0-0 libudev-dev`).
 - **macOS:** install [Homebrew](https://brew.sh/) and run `brew install libusb` if it is not already available.
 - **Windows:** if necessary, use [Zadig](https://zadig.akeo.ie/) to install a WinUSB driver for your debug probe.
 
