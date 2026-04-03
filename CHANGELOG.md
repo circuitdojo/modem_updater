@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5] - 2026-04-03
+
+- Improved error handling when no debug probe is connected. Now shows a friendly message instead of a probe-rs panic.
+
 ## [0.1.4] - 2026-04-03
 
 - Added explicit `nrf9151` and `nrf9160` target profiles to the updater flow.

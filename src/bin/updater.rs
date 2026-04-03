@@ -103,21 +103,43 @@ fn parse_args() -> Result<Args, String> {
 fn open_probe(lister: &Lister) -> Probe {
     let start = Utc::now().timestamp_millis();
 
+    let selector = DebugProbeSelector {
+        vendor_id: PROBE_VENDOR_ID,
+        product_id: PROBE_PRODUCT_ID,
+        interface: None,
+        serial_number: None,
+    };
+
+    // Suppress panic output from probe-rs internals (e.g. Glasgow driver)
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
     loop {
-        match lister.open(DebugProbeSelector {
-            vendor_id: PROBE_VENDOR_ID,
-            product_id: PROBE_PRODUCT_ID,
-            interface: None,
-            serial_number: None,
-        }) {
-            Ok(mut probe) => {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lister.open(selector.clone())
+        }));
+
+        match result {
+            Ok(Ok(mut probe)) => {
+                std::panic::set_hook(default_hook);
                 probe.set_speed(12000).unwrap();
                 return probe;
             }
-            Err(_e) => {
+            Ok(Err(_)) | Err(_) => {
                 let now = Utc::now().timestamp_millis();
                 if now > start + 2000 {
-                    panic!("Unable to get probe!");
+                    std::panic::set_hook(default_hook);
+
+                    // Check if the probe is visible on USB but failed to open
+                    let probes = lister.list(Some(&selector));
+                    if probes.is_empty() {
+                        eprintln!("\nError: No debug probe detected.");
+                        eprintln!("Please check that the programmer is connected via USB and powered on.");
+                    } else {
+                        eprintln!("\nError: Debug probe found but unable to initialize.");
+                        eprintln!("Please check that the target board is connected to the programmer.");
+                    }
+                    std::process::exit(1);
                 }
 
                 thread::sleep(Duration::from_millis(100));
