@@ -59,9 +59,12 @@
 //! let probe = lister.open(DebugProbeSelector {
 //!     vendor_id: 0x2e8a,
 //!     product_id: 0x000c,
+//!     interface: None,
 //!     serial_number: None,
 //! }).unwrap();
-//! let mut session = probe.attach("nRF9160_xxAA", Permissions::new().allow_erase_all()).unwrap();
+//! let mut session = probe
+//!     .attach("nRF9151_xxAA", Permissions::new().allow_erase_all())
+//!     .unwrap();
 //! let mut updater = ModemUpdater::new(&mut session);
 //! updater.program_and_verify("modem_update.zip").unwrap();
 //! ```
@@ -95,11 +98,125 @@ const IPC_PIPELINED_MAX_BUFFER_SIZE: usize = 0xE000;
 /// Maximum buffer size for non-pipelined operations
 const IPC_MAX_BUFFER_SIZE: usize = 0x10000;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TargetProfile {
+    Nrf9160,
+    #[default]
+    Nrf9151,
+}
+
+impl TargetProfile {
+    pub fn probe_rs_target_name(self) -> &'static str {
+        match self {
+            Self::Nrf9160 => "nRF9160_xxAA",
+            Self::Nrf9151 => "nRF9151_xxAA",
+        }
+    }
+
+    fn hfxo_config(self) -> HfxoConfig {
+        HfxoConfig {
+            hfxosr_address: 0x00FF801C,
+            hfxocnt_address: 0x00FF8020,
+            hfxosr_value: 0x0000000E,
+            hfxocnt_value: 0x00000020,
+            write_mode: match self {
+                Self::Nrf9160 => UicrWriteMode::Raw,
+                Self::Nrf9151 => UicrWriteMode::FlashAlgorithm,
+            },
+        }
+    }
+
+    fn ipc_config(self) -> IpcConfig {
+        IpcConfig {
+            route_address: 0x500038A8,
+            route_value: 0x00000002,
+            send_cnf0_address: 0x4002A514,
+            send_cnf0_value: 0x00000002,
+            send_cnf2_address: 0x4002A51C,
+            send_cnf2_value: 0x00000008,
+            gpmem_address: 0x4002A610,
+            gpmem_value: 0x21000000,
+            gpmem_size_address: 0x4002A614,
+            gpmem_size_value: 0x00000000,
+            receive_fault_address: 0x4002A590,
+            receive_fault_mask: 0x00000001,
+            receive_command_address: 0x4002A598,
+            receive_command_mask: match self {
+                Self::Nrf9160 => 0x00000004,
+                Self::Nrf9151 => 0x0000FFFF,
+            },
+            receive_data_address: 0x4002A5A0,
+            receive_data_mask: match self {
+                Self::Nrf9160 => 0x00000010,
+                Self::Nrf9151 => 0x0000FFFF,
+            },
+        }
+    }
+}
+
+impl std::str::FromStr for TargetProfile {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "nrf9160" | "9160" => Ok(Self::Nrf9160),
+            "nrf9151" | "9151" => Ok(Self::Nrf9151),
+            _ => Err("supported values are: nrf9160, nrf9151"),
+        }
+    }
+}
+
+impl std::fmt::Display for TargetProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Nrf9160 => f.write_str("nrf9160"),
+            Self::Nrf9151 => f.write_str("nrf9151"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HfxoConfig {
+    hfxosr_address: u64,
+    hfxocnt_address: u64,
+    hfxosr_value: u32,
+    hfxocnt_value: u32,
+    write_mode: UicrWriteMode,
+}
+
+#[derive(Clone, Copy)]
+enum UicrWriteMode {
+    Raw,
+    FlashAlgorithm,
+}
+
+#[derive(Clone, Copy)]
+struct IpcConfig {
+    route_address: u64,
+    route_value: u32,
+    send_cnf0_address: u64,
+    send_cnf0_value: u32,
+    send_cnf2_address: u64,
+    send_cnf2_value: u32,
+    gpmem_address: u64,
+    gpmem_value: u32,
+    gpmem_size_address: u64,
+    gpmem_size_value: u32,
+    receive_fault_address: u64,
+    receive_fault_mask: u32,
+    receive_command_address: u64,
+    receive_command_mask: u32,
+    receive_data_address: u64,
+    receive_data_mask: u32,
+}
+
 #[derive(Error, Debug)]
 pub enum ModemUpdateError {
     /// Error while writing to flash
     #[error("{0}")]
     ProbeError(#[from] probe_rs::Error),
+    #[error("{0}")]
+    FileDownloadError(#[from] flashing::FileDownloadError),
     /// Timeout while waiting for ACK or NACK response
     #[error("Timeout waiting for ACK or NACK response")]
     Timeout,
@@ -119,10 +236,12 @@ pub enum ModemUpdateError {
 /// Main struct for performing modem firmware updates
 pub struct ModemUpdater<'a> {
     session: &'a mut Session,
+    target_profile: TargetProfile,
     pipelined: bool,
     segments: BTreeMap<String, PathBuf>,
     firmware_update_digest: Option<String>,
     progress_callback: Option<Box<dyn FnMut(u64, u64) + 'static>>,
+    status_callback: Option<Box<dyn FnMut(&str) + 'static>>,
     progress_total: u64,
     progress_current: u64,
 }
@@ -148,12 +267,19 @@ fn change_endianness(x: u32, n: u32) -> u32 {
 impl<'a> ModemUpdater<'a> {
     /// Creates a new ModemUpdater instance
     pub fn new(session: &'a mut Session) -> Self {
+        Self::new_with_target(session, TargetProfile::default())
+    }
+
+    /// Creates a new ModemUpdater instance for a specific nRF91 target profile
+    pub fn new_with_target(session: &'a mut Session, target_profile: TargetProfile) -> Self {
         Self {
             session,
+            target_profile,
             pipelined: false,
             segments: BTreeMap::new(),
             firmware_update_digest: None,
             progress_callback: None,
+            status_callback: None,
             progress_total: 0,
             progress_current: 0,
         }
@@ -167,9 +293,23 @@ impl<'a> ModemUpdater<'a> {
         self.progress_callback = Some(Box::new(callback));
     }
 
+    /// Registers a callback that receives human-readable stage updates.
+    pub fn set_status_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(&str) + 'static,
+    {
+        self.status_callback = Some(Box::new(callback));
+    }
+
     fn emit_progress(&mut self) {
         if let Some(cb) = self.progress_callback.as_mut() {
             cb(self.progress_current, self.progress_total);
+        }
+    }
+
+    fn emit_status(&mut self, status: &str) {
+        if let Some(cb) = self.status_callback.as_mut() {
+            cb(status);
         }
     }
 
@@ -212,9 +352,12 @@ impl<'a> ModemUpdater<'a> {
         // Get temporary directory
         let temp_dir = TempDir::new().unwrap();
 
+        self.emit_status("Preparing device");
         self.setup_device()?;
+        self.emit_status("Loading firmware package");
         self.process_zip_file(mfw_zip, &temp_dir)?;
 
+        self.emit_status("Verifying modem firmware");
         log::info!("Verifying modem firmware.");
         match self._verify() {
             Ok(v) => {
@@ -249,7 +392,9 @@ impl<'a> ModemUpdater<'a> {
         // Get temporary directory
         let temp_dir = TempDir::new().unwrap();
 
+        self.emit_status("Preparing device");
         self.setup_device()?;
+        self.emit_status("Loading firmware package");
         self.process_zip_file(mfw_zip, &temp_dir)?;
 
         let total_bytes = self.calculate_total_segment_bytes();
@@ -259,6 +404,7 @@ impl<'a> ModemUpdater<'a> {
             self.emit_progress();
         }
 
+        self.emit_status("Programming modem firmware");
         log::info!("Programming modem firmware..");
 
         for s in self.segments.values().cloned().collect::<Vec<PathBuf>>() {
@@ -272,6 +418,7 @@ impl<'a> ModemUpdater<'a> {
             self.emit_progress();
         }
 
+        self.emit_status("Verifying modem firmware");
         log::info!("Verifying modem firmware.");
         let verified = match self._verify() {
             Ok(v) => {
@@ -492,6 +639,7 @@ impl<'a> ModemUpdater<'a> {
     /// * `Ok(())` if events were received and acknowledged
     /// * `Err` if a timeout or error occurred
     fn wait_and_ack_events(&mut self) -> Result<(), ModemUpdateError> {
+        self.emit_status("Waiting for modem response");
         // Loop until we get an ACK or NACK with timeout
         let start = Utc::now().timestamp_millis();
 
@@ -557,34 +705,24 @@ impl<'a> ModemUpdater<'a> {
     ///
     /// Configures UICR settings, IPC, and RAM for firmware updates
     fn setup_device(&mut self) -> Result<(), ModemUpdateError> {
-        // First, reset and halt the core to ensure we have control
-        // This is especially important if application firmware is already running
+        self.emit_status("Configuring device");
+        self.ensure_hfxo_config()?;
+
+        let ipc = self.target_profile.ipc_config();
         let mut target = self.session.core(0)?;
         target.reset_and_halt(Duration::from_secs(5))?;
 
-        // Init UICR.HFXOSR if necessary
-        if target.read_word_32(0x00FF801C)? == 0xFFFFFFFF {
-            log::info!("UICR.HFXOSR is not set, setting it to 0x0E");
-            target.write_32(0x00FF801C, &[0x0000000E])?;
-        }
-
-        // Init UICR.HFXOCNT if necessary
-        if target.read_word_32(0x00FF8020)? == 0xFFFFFFFF {
-            log::info!("UICR.HFXOCNT is not set, setting it to 0x20");
-            target.write_word_32(0x00FF8020, 0x00000020)?;
-        }
-
         // Configure IPC
-        target.write_word_32(0x500038A8, 0x00000002)?;
+        target.write_word_32(ipc.route_address, ipc.route_value)?;
 
         // Configure IPC HW for DFU
-        target.write_word_32(0x4002A514, 0x00000002)?;
-        target.write_word_32(0x4002A51C, 0x00000008)?;
-        target.write_word_32(0x4002A610, 0x21000000)?;
-        target.write_word_32(0x4002A614, 0x00000000)?;
-        target.write_word_32(0x4002A590, 0x00000001)?;
-        target.write_word_32(0x4002A598, 0x00000004)?;
-        target.write_word_32(0x4002A5A0, 0x00000010)?;
+        target.write_word_32(ipc.send_cnf0_address, ipc.send_cnf0_value)?;
+        target.write_word_32(ipc.send_cnf2_address, ipc.send_cnf2_value)?;
+        target.write_word_32(ipc.gpmem_address, ipc.gpmem_value)?;
+        target.write_word_32(ipc.gpmem_size_address, ipc.gpmem_size_value)?;
+        target.write_word_32(ipc.receive_fault_address, ipc.receive_fault_mask)?;
+        target.write_word_32(ipc.receive_command_address, ipc.receive_command_mask)?;
+        target.write_word_32(ipc.receive_data_address, ipc.receive_data_mask)?;
 
         // Configure RAM as non-secure
         for n in 0..32 {
@@ -606,6 +744,85 @@ impl<'a> ModemUpdater<'a> {
         Ok(())
     }
 
+    fn ensure_hfxo_config(&mut self) -> Result<(), ModemUpdateError> {
+        let config = self.target_profile.hfxo_config();
+        let (hfxosr, hfxocnt) = {
+            let mut target = self.session.core(0)?;
+            target.reset_and_halt(Duration::from_secs(5))?;
+            (
+                target.read_word_32(config.hfxosr_address)?,
+                target.read_word_32(config.hfxocnt_address)?,
+            )
+        };
+
+        let needs_hfxosr = hfxosr == 0xFFFFFFFF;
+        let needs_hfxocnt = hfxocnt == 0xFFFFFFFF;
+        if !needs_hfxosr && !needs_hfxocnt {
+            return Ok(());
+        }
+
+        match config.write_mode {
+            UicrWriteMode::Raw => {
+                self.emit_status("Programming UICR");
+                let mut target = self.session.core(0)?;
+                target.reset_and_halt(Duration::from_secs(5))?;
+
+                if needs_hfxosr {
+                    log::info!(
+                        "UICR.HFXOSR is not set for {}, setting it to 0x{:02X}",
+                        self.target_profile,
+                        config.hfxosr_value
+                    );
+                    target.write_32(config.hfxosr_address, &[config.hfxosr_value])?;
+                }
+
+                if needs_hfxocnt {
+                    log::info!(
+                        "UICR.HFXOCNT is not set for {}, setting it to 0x{:02X}",
+                        self.target_profile,
+                        config.hfxocnt_value
+                    );
+                    target.write_word_32(config.hfxocnt_address, config.hfxocnt_value)?;
+                }
+            }
+            UicrWriteMode::FlashAlgorithm => {
+                self.emit_status("Programming UICR");
+                let hfxosr_value = if needs_hfxosr {
+                    config.hfxosr_value
+                } else {
+                    hfxosr
+                };
+                let hfxocnt_value = if needs_hfxocnt {
+                    config.hfxocnt_value
+                } else {
+                    hfxocnt
+                };
+
+                let mut uicr_bin: Vec<u8> = Vec::with_capacity(8);
+                uicr_bin.extend_from_slice(&hfxosr_value.to_le_bytes());
+                uicr_bin.extend_from_slice(&hfxocnt_value.to_le_bytes());
+
+                let uicr_tmp = tempfile::NamedTempFile::new().unwrap();
+                std::fs::write(uicr_tmp.path(), &uicr_bin).unwrap();
+
+                log::info!(
+                    "Programming UICR HFXO settings for {} via flash algorithm",
+                    self.target_profile
+                );
+                flashing::download_file(
+                    self.session,
+                    uicr_tmp.path(),
+                    flashing::Format::Bin(flashing::BinOptions {
+                        base_address: Some(config.hfxosr_address),
+                        skip: 0,
+                    }),
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Processes the firmware zip file and extracts necessary components
     ///
     /// # Arguments
@@ -616,6 +833,7 @@ impl<'a> ModemUpdater<'a> {
         mfw_zip: &str,
         temp_dir: &TempDir,
     ) -> Result<(), ModemUpdateError> {
+        self.emit_status("Extracting firmware package");
         // Unzip to temp dir
         let file = File::open(mfw_zip).unwrap();
         ZipArchive::new(file)
@@ -751,11 +969,13 @@ impl<'a> ModemUpdater<'a> {
             modem_firmware_loader.display()
         );
 
+        self.emit_status("Programming modem loader");
         // Program the modem_firmware_loader hex
         flashing::download_file(self.session, modem_firmware_loader, flashing::Format::Hex)
             .unwrap();
 
         {
+            self.emit_status("Starting modem loader");
             // Start IPC task
             let mut core = self.session.core(0)?;
             core.write_word_32(0x4002A004, 0x00000001)?;
@@ -767,5 +987,35 @@ impl<'a> ModemUpdater<'a> {
         log::info!("modem_firmware_loader started!");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TargetProfile;
+
+    #[test]
+    fn parses_target_profiles() {
+        assert_eq!(
+            "nrf9160".parse::<TargetProfile>().unwrap(),
+            TargetProfile::Nrf9160
+        );
+        assert_eq!(
+            "9151".parse::<TargetProfile>().unwrap(),
+            TargetProfile::Nrf9151
+        );
+        assert!("nrf9999".parse::<TargetProfile>().is_err());
+    }
+
+    #[test]
+    fn exposes_probe_rs_target_names() {
+        assert_eq!(
+            TargetProfile::Nrf9160.probe_rs_target_name(),
+            "nRF9160_xxAA"
+        );
+        assert_eq!(
+            TargetProfile::Nrf9151.probe_rs_target_name(),
+            "nRF9151_xxAA"
+        );
     }
 }

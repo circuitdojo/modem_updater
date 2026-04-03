@@ -45,10 +45,16 @@ use std::{thread, time::Duration};
 
 use chrono::Utc;
 use indicatif::{HumanBytes, ProgressBar, ProgressState, ProgressStyle};
-use modem_updater::ModemUpdater;
+use modem_updater::{ModemUpdater, TargetProfile};
 use probe_rs::{
-    probe::{list::Lister, DebugProbeSelector},
-    Permissions,
+    architecture::arm::{
+        ap::{ApRegister, CSW, IDR},
+        dp::DpAddress,
+        sequences::DefaultArmSequence,
+        ArmDebugInterface, FullyQualifiedApAddress,
+    },
+    probe::{list::Lister, DebugProbeSelector, Probe},
+    Error, Permissions, Session,
 };
 
 fn print_usage() {
@@ -61,64 +67,292 @@ fn print_usage() {
     println!("  updater program _bin/mfw_nrf91x1_2.0.2.zip");
 }
 
+struct Args {
+    operation: String,
+    path: String,
+}
+
+const PROBE_VENDOR_ID: u16 = 0x2e8a;
+const PROBE_PRODUCT_ID: u16 = 0x000c;
+const APP_MEM: FullyQualifiedApAddress = FullyQualifiedApAddress::v1_with_default_dp(0);
+const CTRL_AP: FullyQualifiedApAddress = FullyQualifiedApAddress::v1_with_default_dp(4);
+const FICR_INFO_PART: u64 = 0x00FF0140;
+const CTRL_ERASEALL: u64 = 0x004;
+const CTRL_ERASEALLSTATUS: u64 = 0x008;
+const CTRL_RESET: u64 = 0x000;
+const UNLOCK_RETRIES: u32 = 3;
+const ERASE_TIMEOUT_MS: u64 = 5000;
+const DHCSR: u64 = 0xE000_EDF0;
+const C_HALT: u32 = 0x2;
+const C_DEBUGEN: u32 = 0x1;
+const DBGKEY: u32 = 0xA05F_0000;
+
+fn parse_args() -> Result<Args, String> {
+    let mut positional: Vec<_> = std::env::args().skip(1).collect();
+
+    if positional.len() != 2 {
+        return Err("expected <operation> <firmware_path>".to_string());
+    }
+
+    Ok(Args {
+        operation: positional.remove(0),
+        path: positional.remove(0),
+    })
+}
+
+fn open_probe(lister: &Lister) -> Probe {
+    let start = Utc::now().timestamp_millis();
+
+    loop {
+        match lister.open(DebugProbeSelector {
+            vendor_id: PROBE_VENDOR_ID,
+            product_id: PROBE_PRODUCT_ID,
+            interface: None,
+            serial_number: None,
+        }) {
+            Ok(mut probe) => {
+                probe.set_speed(12000).unwrap();
+                return probe;
+            }
+            Err(_e) => {
+                let now = Utc::now().timestamp_millis();
+                if now > start + 2000 {
+                    panic!("Unable to get probe!");
+                }
+
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn should_try_recover(err: &Error) -> bool {
+    matches!(err, Error::Arm(_) | Error::MissingPermissions(_))
+}
+
+fn detect_target_profile(mut probe: Probe) -> Result<TargetProfile, Error> {
+    probe.attach_to_unspecified()?;
+    let mut iface = probe
+        .try_into_arm_debug_interface(DefaultArmSequence::create())
+        .map_err(|(_, err)| Error::from(err))?;
+
+    iface.select_debug_port(DpAddress::Default)?;
+
+    let mut memory = iface.memory_interface(&APP_MEM).map_err(Error::from)?;
+    let part_info = format!("{:08X}", memory.read_word_32(FICR_INFO_PART)?);
+
+    match part_info.as_str() {
+        "00009160" => Ok(TargetProfile::Nrf9160),
+        "00009151" => Ok(TargetProfile::Nrf9151),
+        _ => panic!("Unknown nRF91 part number: {}", part_info),
+    }
+}
+
+fn detect_target_profile_with_recovery(lister: &Lister) -> TargetProfile {
+    match detect_target_profile(open_probe(lister)) {
+        Ok(chip) => chip,
+        Err(err) if should_try_recover(&err) => {
+            log::warn!(
+                "Initial chip detection failed: {}. Trying nRF91 unlock sequence.",
+                err
+            );
+
+            restore_debug_access(open_probe(lister)).unwrap_or_else(|recover_err| {
+                panic!(
+                    "Unable to restore debug access before chip detection: {}",
+                    recover_err
+                )
+            });
+
+            detect_target_profile(open_probe(lister)).unwrap_or_else(|retry_err| {
+                panic!(
+                    "Unable to detect target chip after recovery! Error: {}",
+                    retry_err
+                )
+            })
+        }
+        Err(err) => panic!("Unable to detect target chip! Error: {}", err),
+    }
+}
+
+fn halt_cpu_if_possible(iface: &mut dyn ArmDebugInterface) {
+    match iface.write_raw_ap_register(&APP_MEM, DHCSR, DBGKEY | C_DEBUGEN | C_HALT) {
+        Ok(_) => {
+            log::info!("CPU halted successfully");
+            thread::sleep(Duration::from_millis(10));
+        }
+        Err(err) => {
+            log::warn!("Could not halt CPU (device may be locked): {}", err);
+        }
+    }
+}
+
+fn check_debug_access(iface: &mut dyn ArmDebugInterface) -> Result<bool, Error> {
+    let csw = iface.read_raw_ap_register(&APP_MEM, CSW::ADDRESS)?;
+    let dbg_status = (csw >> 6) & 1;
+    log::info!("CSW: 0x{:08X}, DbgStatus: {}", csw, dbg_status);
+    Ok(dbg_status == 1)
+}
+
+fn perform_device_reset(iface: &mut dyn ArmDebugInterface) -> Result<(), Error> {
+    iface.write_raw_ap_register(&CTRL_AP, CTRL_RESET, 1)?;
+    thread::sleep(Duration::from_millis(1));
+    iface.write_raw_ap_register(&CTRL_AP, CTRL_RESET, 0)?;
+    thread::sleep(Duration::from_millis(20));
+    log::info!("Performed soft reset");
+    Ok(())
+}
+
+fn rapid_chip_erase(iface: &mut dyn ArmDebugInterface, timeout_ms: u64) -> Result<(), Error> {
+    iface.write_raw_ap_register(&CTRL_AP, CTRL_ERASEALL, 1)?;
+    log::warn!("Started CTRL-AP ERASEALL");
+
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+
+    while start.elapsed() < Duration::from_millis(100) {
+        if iface.read_raw_ap_register(&CTRL_AP, CTRL_ERASEALLSTATUS)? == 0 {
+            log::info!("Erase completed in {:?}", start.elapsed());
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    while start.elapsed() < timeout {
+        if iface.read_raw_ap_register(&CTRL_AP, CTRL_ERASEALLSTATUS)? == 0 {
+            log::info!("Erase completed in {:?}", start.elapsed());
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Err(Error::Timeout)
+}
+
+fn restore_debug_access(mut probe: Probe) -> Result<(), Error> {
+    probe.attach_to_unspecified()?;
+    let mut iface = probe
+        .try_into_arm_debug_interface(DefaultArmSequence::create())
+        .map_err(|(_, err)| Error::from(err))?;
+
+    iface.select_debug_port(DpAddress::Default)?;
+    halt_cpu_if_possible(&mut *iface);
+
+    if let Ok(true) = check_debug_access(&mut *iface) {
+        log::info!("Device already unlocked");
+        return Ok(());
+    }
+
+    let idr = iface
+        .read_raw_ap_register(&CTRL_AP, IDR::ADDRESS)
+        .unwrap_or(0);
+    log::info!("CTRL-AP IDR: 0x{:08X}", idr);
+    if idr == 0 {
+        return Err(Error::Other(
+            "CTRL-AP not accessible, check connections".to_string(),
+        ));
+    }
+
+    for attempt in 1..=UNLOCK_RETRIES {
+        log::warn!("Unlock attempt {}/{}", attempt, UNLOCK_RETRIES);
+        rapid_chip_erase(&mut *iface, ERASE_TIMEOUT_MS)?;
+        perform_device_reset(&mut *iface)?;
+
+        let verify_start = std::time::Instant::now();
+        let verify_timeout = Duration::from_secs(2);
+
+        while verify_start.elapsed() < verify_timeout {
+            match check_debug_access(&mut *iface) {
+                Ok(true) => {
+                    log::info!("Device unlocked successfully");
+                    return Ok(());
+                }
+                Ok(false) if verify_start.elapsed() > Duration::from_millis(500) => {
+                    log::warn!("Debug access not enabled after reset");
+                    break;
+                }
+                Ok(false) => thread::sleep(Duration::from_millis(50)),
+                Err(err) => {
+                    log::warn!("Error checking debug status: {}", err);
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+
+        if attempt < UNLOCK_RETRIES {
+            thread::sleep(Duration::from_millis(1000));
+        }
+    }
+
+    Err(Error::Other(
+        "Failed to unlock device after all retries".to_string(),
+    ))
+}
+
+fn attach_session(lister: &Lister, chip: TargetProfile) -> Session {
+    let probe = open_probe(lister);
+
+    match probe.attach(
+        chip.probe_rs_target_name(),
+        Permissions::new().allow_erase_all(),
+    ) {
+        Ok(session) => session,
+        Err(err) if should_try_recover(&err) => {
+            log::warn!(
+                "Initial attach to {} failed: {}. Trying nRF91 unlock sequence.",
+                chip,
+                err
+            );
+
+            restore_debug_access(open_probe(lister)).unwrap_or_else(|recover_err| {
+                panic!("Unable to restore debug access: {}", recover_err)
+            });
+
+            let probe = open_probe(lister);
+            probe
+                .attach(
+                    chip.probe_rs_target_name(),
+                    Permissions::new().allow_erase_all(),
+                )
+                .unwrap_or_else(|retry_err| {
+                    panic!(
+                        "Unable to attach to probe after recovery! Error: {}",
+                        retry_err
+                    )
+                })
+        }
+        Err(err) => panic!("Unable to attach to probe! Error: {}", err),
+    }
+}
+
 fn main() {
     env_logger::init();
 
-    // Check if any arguments were provided
-    if std::env::args().len() < 3 {
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("Argument error: {err}");
+            print_usage();
+            std::process::exit(1);
+        }
+    };
+
+    if args.operation != "verify" && args.operation != "program" {
+        println!("\nError: Unknown operation '{}'", args.operation);
         print_usage();
         std::process::exit(1);
     }
 
     let lister = Lister::new();
-    let mut probe;
+    let chip = detect_target_profile_with_recovery(&lister);
 
-    // First argument is the operation (verify or program)
-    let operation = std::env::args().nth(1).expect("Operation not provided!");
-
-    // Get second arguement as path to firmware
-    let path = std::env::args()
-        .nth(2)
-        .expect("Firmware path not provided!");
-
-    // Get probe with timeout
-    let start = Utc::now().timestamp_millis();
-    loop {
-        probe = match lister.open(DebugProbeSelector {
-            vendor_id: 0x2e8a,
-            product_id: 0x000c,
-            interface: None,
-            serial_number: None,
-        }) {
-            Ok(p) => p,
-            Err(_e) => {
-                let now = Utc::now().timestamp_millis();
-                if now > start + 2000 {
-                    panic!("Unable to get probe!");
-                } else {
-                    thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-            }
-        };
-
-        break;
-    }
-
-    // Set speed
-    probe.set_speed(12000).unwrap();
-
-    // Attach
-    let mut session = match probe.attach("nRF9160_xxAA", Permissions::new().allow_erase_all()) {
-        Ok(s) => s,
-        Err(e) => panic!("Unable to attach to probe! Error: {}", e),
-    };
+    let mut session = attach_session(&lister, chip);
 
     // Get updater
-    let mut updater = ModemUpdater::new(&mut session);
+    let mut updater = ModemUpdater::new_with_target(&mut session, chip);
 
-    if operation == "verify" {
-        match updater.verify(&path) {
+    if args.operation == "verify" {
+        match updater.verify(&args.path) {
             Ok(true) => println!("Firmware verification succeeded."),
             Ok(false) => {
                 eprintln!("Firmware verification failed. Inspect device logs for details.");
@@ -129,7 +363,7 @@ fn main() {
                 std::process::exit(2);
             }
         }
-    } else if operation == "program" {
+    } else if args.operation == "program" {
         let progress_bar = ProgressBar::new(0);
         progress_bar.set_style(
             ProgressStyle::with_template(
@@ -167,7 +401,7 @@ fn main() {
             }
         });
 
-        match updater.program_and_verify(&path) {
+        match updater.program_and_verify(&args.path) {
             Ok(true) => {
                 progress_bar.finish_and_clear();
                 println!("Programming complete. Firmware verification succeeded.");
@@ -185,9 +419,5 @@ fn main() {
                 std::process::exit(3);
             }
         }
-    } else {
-        println!("\nError: Unknown operation '{}'", operation);
-        print_usage();
-        std::process::exit(1);
     }
 }

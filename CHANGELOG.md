@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-04-03
+
+- Added explicit `nrf9151` and `nrf9160` target profiles to the updater flow.
+- Added nRF91 part-number detection so the CLI auto-selects `nrf9151` vs `nrf9160`.
+- Aligned updater pre-attach recovery with the working recovery flow, including CTRL-AP `AP4` erase/reset handling for locked devices.
+
 ## [0.1.2] - 2025-09-25
 
 - Added a CLI progress bar and explicit verification reporting during modem updates.

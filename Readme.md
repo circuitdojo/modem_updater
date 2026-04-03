@@ -61,6 +61,10 @@ To program and verify the modem firmware, run:
 updater program <path_to_firmware_zip>
 ```
 
+The CLI auto-detects the connected nRF91 target by reading the device part number.
+If raw debug access is unavailable, `updater` will attempt to restore access using the same
+nRF91 unlock flow as the companion recovery tool before continuing.
+
 ## Developement
 
 ### 1. Install the Rust toolchain
@@ -99,6 +103,16 @@ cargo build --release
 
 The resulting executable are located in `target/release/`:
 - `updater` - Main firmware update tool
+
+### 4. Target detection and recovery
+
+The library and CLI support both `nrf9151` and `nrf9160` target profiles.
+
+- `updater` auto-detects the target profile from FICR part information
+- if debug access is blocked, `updater` first tries to restore access non-interactively
+- if the device is still locked, `updater` falls back to the nRF91 CTRL-AP erase-and-reset flow
+
+This split exists because the modem DFU bring-up sequence is not identical across the chips. In particular, UICR programming and IPC receive masks differ between the profiles.
 
 ## Acknowledgements
 
