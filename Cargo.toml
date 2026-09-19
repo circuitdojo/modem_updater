@@ -1,7 +1,7 @@
 [package]
 name = "modem_updater"
-version = "0.1.5"
-authors = ["Jared Wolff <jared@circuitdojo.com>"]
+version = "0.1.6"
+authors = ["Jared Wolff <jared@circuitdojo.com>", "Sascha Klick <sascha.klick@toasternet.eu>"]
 description = "Utility for updating nRF91 modem firmware"
 edition = "2021"
 license = "MIT OR Apache-2.0"

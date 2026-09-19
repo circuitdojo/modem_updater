@@ -67,6 +67,7 @@ fn print_usage() {
     println!("  --vid <id>       - USB vendor ID of the debug probe (e.g. 0x2e8a)");
     println!("  --pid <id>       - USB product ID of the debug probe (e.g. 0x000c)");
     println!("  --serial <str>   - Serial number of the debug probe");
+    println!("  --speed <khz>    - SWD clock speed in kHz (default: 12000)");
     println!("\nWithout options, exactly one debug probe must be connected.");
     println!("\nExample:");
     println!("  updater program _bin/mfw_nrf91x1_2.0.2.zip");
@@ -78,7 +79,10 @@ struct Args {
     vid: Option<u16>,
     pid: Option<u16>,
     serial: Option<String>,
+    speed: u32,
 }
+
+const DEFAULT_SPEED_KHZ: u32 = 12000;
 
 const APP_MEM: FullyQualifiedApAddress = FullyQualifiedApAddress::v1_with_default_dp(0);
 const CTRL_AP: FullyQualifiedApAddress = FullyQualifiedApAddress::v1_with_default_dp(4);
@@ -108,6 +112,7 @@ fn parse_args() -> Result<Args, String> {
     let mut vid = None;
     let mut pid = None;
     let mut serial = None;
+    let mut speed = DEFAULT_SPEED_KHZ;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -122,6 +127,16 @@ fn parse_args() -> Result<Args, String> {
             }
             "--serial" => {
                 serial = Some(args.next().ok_or("--serial requires a value")?);
+            }
+            "--speed" => {
+                let value = args.next().ok_or("--speed requires a value")?;
+                speed = value
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|e| format!("invalid value '{value}': {e}"))?;
+                if speed == 0 {
+                    return Err("--speed must be greater than 0".to_string());
+                }
             }
             other if other.starts_with("--") => {
                 return Err(format!("unknown option '{other}'"));
@@ -140,6 +155,7 @@ fn parse_args() -> Result<Args, String> {
         vid,
         pid,
         serial,
+        speed,
     })
 }
 
@@ -202,7 +218,7 @@ fn select_probe(lister: &Lister, args: &Args) -> Result<DebugProbeSelector, Stri
     }
 }
 
-fn open_probe(lister: &Lister, selector: &DebugProbeSelector) -> Probe {
+fn open_probe(lister: &Lister, selector: &DebugProbeSelector, speed_khz: u32) -> Probe {
     let start = Utc::now().timestamp_millis();
 
     // Suppress panic output from probe-rs internals (e.g. Glasgow driver)
@@ -217,7 +233,7 @@ fn open_probe(lister: &Lister, selector: &DebugProbeSelector) -> Probe {
         match result {
             Ok(Ok(mut probe)) => {
                 std::panic::set_hook(default_hook);
-                probe.set_speed(12000).unwrap();
+                probe.set_speed(speed_khz).unwrap();
                 return probe;
             }
             Ok(Err(_)) | Err(_) => {
@@ -272,8 +288,9 @@ fn detect_target_profile(mut probe: Probe) -> Result<TargetProfile, Error> {
 fn detect_target_profile_with_recovery(
     lister: &Lister,
     selector: &DebugProbeSelector,
+    speed_khz: u32,
 ) -> TargetProfile {
-    match detect_target_profile(open_probe(lister, selector)) {
+    match detect_target_profile(open_probe(lister, selector, speed_khz)) {
         Ok(chip) => chip,
         Err(err) if should_try_recover(&err) => {
             log::warn!(
@@ -281,19 +298,23 @@ fn detect_target_profile_with_recovery(
                 err
             );
 
-            restore_debug_access(open_probe(lister, selector)).unwrap_or_else(|recover_err| {
-                panic!(
-                    "Unable to restore debug access before chip detection: {}",
-                    recover_err
-                )
-            });
+            restore_debug_access(open_probe(lister, selector, speed_khz)).unwrap_or_else(
+                |recover_err| {
+                    panic!(
+                        "Unable to restore debug access before chip detection: {}",
+                        recover_err
+                    )
+                },
+            );
 
-            detect_target_profile(open_probe(lister, selector)).unwrap_or_else(|retry_err| {
-                panic!(
-                    "Unable to detect target chip after recovery! Error: {}",
-                    retry_err
-                )
-            })
+            detect_target_profile(open_probe(lister, selector, speed_khz)).unwrap_or_else(
+                |retry_err| {
+                    panic!(
+                        "Unable to detect target chip after recovery! Error: {}",
+                        retry_err
+                    )
+                },
+            )
         }
         Err(err) => panic!("Unable to detect target chip! Error: {}", err),
     }
@@ -413,8 +434,13 @@ fn restore_debug_access(mut probe: Probe) -> Result<(), Error> {
     ))
 }
 
-fn attach_session(lister: &Lister, selector: &DebugProbeSelector, chip: TargetProfile) -> Session {
-    let probe = open_probe(lister, selector);
+fn attach_session(
+    lister: &Lister,
+    selector: &DebugProbeSelector,
+    chip: TargetProfile,
+    speed_khz: u32,
+) -> Session {
+    let probe = open_probe(lister, selector, speed_khz);
 
     match probe.attach(
         chip.probe_rs_target_name(),
@@ -428,11 +454,11 @@ fn attach_session(lister: &Lister, selector: &DebugProbeSelector, chip: TargetPr
                 err
             );
 
-            restore_debug_access(open_probe(lister, selector)).unwrap_or_else(|recover_err| {
-                panic!("Unable to restore debug access: {}", recover_err)
-            });
+            restore_debug_access(open_probe(lister, selector, speed_khz)).unwrap_or_else(
+                |recover_err| panic!("Unable to restore debug access: {}", recover_err),
+            );
 
-            let probe = open_probe(lister, selector);
+            let probe = open_probe(lister, selector, speed_khz);
             probe
                 .attach(
                     chip.probe_rs_target_name(),
@@ -472,9 +498,9 @@ fn main() {
         eprintln!("Error: {err}");
         std::process::exit(1);
     });
-    let chip = detect_target_profile_with_recovery(&lister, &selector);
+    let chip = detect_target_profile_with_recovery(&lister, &selector, args.speed);
 
-    let mut session = attach_session(&lister, &selector, chip);
+    let mut session = attach_session(&lister, &selector, chip, args.speed);
 
     // Get updater
     let mut updater = ModemUpdater::new_with_target(&mut session, chip);
