@@ -233,6 +233,9 @@ pub enum ModemUpdateError {
     NoDigestFound,
 }
 
+type ProgressCallback = Box<dyn FnMut(u64, u64) + 'static>;
+type StatusCallback = Box<dyn FnMut(&str) + 'static>;
+
 /// Main struct for performing modem firmware updates
 pub struct ModemUpdater<'a> {
     session: &'a mut Session,
@@ -240,8 +243,8 @@ pub struct ModemUpdater<'a> {
     pipelined: bool,
     segments: BTreeMap<String, PathBuf>,
     firmware_update_digest: Option<String>,
-    progress_callback: Option<Box<dyn FnMut(u64, u64) + 'static>>,
-    status_callback: Option<Box<dyn FnMut(&str) + 'static>>,
+    progress_callback: Option<ProgressCallback>,
+    status_callback: Option<StatusCallback>,
     progress_total: u64,
     progress_current: u64,
 }

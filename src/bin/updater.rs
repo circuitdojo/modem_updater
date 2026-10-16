@@ -67,7 +67,7 @@ fn print_usage() {
     println!("  --vid <id>       - USB vendor ID of the debug probe (e.g. 0x2e8a)");
     println!("  --pid <id>       - USB product ID of the debug probe (e.g. 0x000c)");
     println!("  --serial <str>   - Serial number of the debug probe");
-    println!("  --speed <khz>    - SWD clock speed in kHz (default: 12000)");
+    println!("  --speed <khz>    - SWD clock speed in kHz for flashing (default: 12000; debug-access recovery uses at most 1000)");
     println!("\nWithout options, exactly one debug probe must be connected.");
     println!("\nExample:");
     println!("  updater program _bin/mfw_nrf91x1_2.0.2.zip");
@@ -83,6 +83,9 @@ struct Args {
 }
 
 const DEFAULT_SPEED_KHZ: u32 = 12000;
+const MAX_SPEED_KHZ: u32 = 100_000;
+// Debug-access recovery is capped low: unlock is the step most prone to SWD errors.
+const UNLOCK_SPEED_KHZ: u32 = 1000;
 
 const APP_MEM: FullyQualifiedApAddress = FullyQualifiedApAddress::v1_with_default_dp(0);
 const CTRL_AP: FullyQualifiedApAddress = FullyQualifiedApAddress::v1_with_default_dp(4);
@@ -134,8 +137,8 @@ fn parse_args() -> Result<Args, String> {
                     .trim()
                     .parse::<u32>()
                     .map_err(|e| format!("invalid value '{value}': {e}"))?;
-                if speed == 0 {
-                    return Err("--speed must be greater than 0".to_string());
+                if speed == 0 || speed > MAX_SPEED_KHZ {
+                    return Err(format!("--speed must be between 1 and {MAX_SPEED_KHZ}"));
                 }
             }
             other if other.starts_with("--") => {
@@ -233,7 +236,14 @@ fn open_probe(lister: &Lister, selector: &DebugProbeSelector, speed_khz: u32) ->
         match result {
             Ok(Ok(mut probe)) => {
                 std::panic::set_hook(default_hook);
-                probe.set_speed(speed_khz).unwrap();
+                match probe.set_speed(speed_khz) {
+                    Ok(actual) => log::info!("SWD speed: {actual} kHz (requested {speed_khz})"),
+                    Err(err) => {
+                        eprintln!("\nError: Failed to set SWD speed to {speed_khz} kHz: {err}");
+                        eprintln!("Try a different value with --speed (e.g. --speed 1000).");
+                        std::process::exit(1);
+                    }
+                }
                 return probe;
             }
             Ok(Err(_)) | Err(_) => {
@@ -298,14 +308,17 @@ fn detect_target_profile_with_recovery(
                 err
             );
 
-            restore_debug_access(open_probe(lister, selector, speed_khz)).unwrap_or_else(
-                |recover_err| {
-                    panic!(
-                        "Unable to restore debug access before chip detection: {}",
-                        recover_err
-                    )
-                },
-            );
+            restore_debug_access(open_probe(
+                lister,
+                selector,
+                speed_khz.min(UNLOCK_SPEED_KHZ),
+            ))
+            .unwrap_or_else(|recover_err| {
+                panic!(
+                    "Unable to restore debug access before chip detection: {}",
+                    recover_err
+                )
+            });
 
             detect_target_profile(open_probe(lister, selector, speed_khz)).unwrap_or_else(
                 |retry_err| {
@@ -454,9 +467,14 @@ fn attach_session(
                 err
             );
 
-            restore_debug_access(open_probe(lister, selector, speed_khz)).unwrap_or_else(
-                |recover_err| panic!("Unable to restore debug access: {}", recover_err),
-            );
+            restore_debug_access(open_probe(
+                lister,
+                selector,
+                speed_khz.min(UNLOCK_SPEED_KHZ),
+            ))
+            .unwrap_or_else(|recover_err| {
+                panic!("Unable to restore debug access: {}", recover_err)
+            });
 
             let probe = open_probe(lister, selector, speed_khz);
             probe
