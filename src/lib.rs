@@ -815,7 +815,7 @@ impl<'a> ModemUpdater<'a> {
                 flashing::download_file(
                     self.session,
                     uicr_tmp.path(),
-                    flashing::Format::Bin(flashing::BinOptions {
+                    flashing::BinLoader(flashing::BinOptions {
                         base_address: Some(config.hfxosr_address),
                         skip: 0,
                     }),
@@ -974,8 +974,7 @@ impl<'a> ModemUpdater<'a> {
 
         self.emit_status("Programming modem loader");
         // Program the modem_firmware_loader hex
-        flashing::download_file(self.session, modem_firmware_loader, flashing::Format::Hex)
-            .unwrap();
+        flashing::download_file(self.session, modem_firmware_loader, flashing::HexLoader).unwrap();
 
         {
             self.emit_status("Starting modem loader");
