@@ -53,7 +53,10 @@ use probe_rs::{
         sequences::DefaultArmSequence,
         ArmDebugInterface, FullyQualifiedApAddress,
     },
-    probe::{list::Lister, DebugProbeInfo, DebugProbeSelector, Probe},
+    probe::{
+        list::{Accessibility, Lister},
+        DebugProbeInfo, DebugProbeSelector, Probe,
+    },
     Error, Permissions, Session,
 };
 
@@ -252,11 +255,19 @@ fn open_probe(lister: &Lister, selector: &DebugProbeSelector, speed_khz: u32) ->
                     std::panic::set_hook(default_hook);
 
                     // Check if the probe is visible on USB but failed to open
-                    let probes = lister.list(Some(selector));
+                    let probes = lister.list_with_access(Some(selector));
                     if probes.is_empty() {
                         eprintln!("\nError: No debug probe detected.");
                         eprintln!(
                             "Please check that the programmer is connected via USB and powered on."
+                        );
+                    } else if probes
+                        .iter()
+                        .any(|p| p.accessibility == Accessibility::PermissionDenied)
+                    {
+                        eprintln!("\nError: Debug probe found but permission was denied.");
+                        eprintln!(
+                            "On Linux, install the probe-rs udev rules: https://probe.rs/docs/getting-started/probe-setup/"
                         );
                     } else {
                         eprintln!("\nError: Debug probe found but unable to initialize.");
